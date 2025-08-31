@@ -18,6 +18,7 @@ This repository contains the end-to-end workflow for my Master’s Thesis on how
 1. DOWNLOADING DATA.pdf: A step-by-step guide to download the Mel spectrograms and audio subsets from MTG-Jamendo. Follow the instructions and adjust only the local paths on your machine.
 2. Dataset_creation.ipynb: Python notebook that documents how the working dataset was built (extraction of acoustic features from Mel spectrograms and audio tracks, integration of mood/theme tags and additional metadata). 
 3. EDA_final.rmd: R Markdown with the exploratory data analysis and modeling (descriptive statistics, data checks and distributions, baseline models, evaluation and interpretability analysis).
+4. AUDIO FEATURE DICTIONARY.pdf: A technical glossary of all audio feature variables used in the project (with definitions, musical and perceptual interpretations...). 
 
 *Data source and licensing*
 
