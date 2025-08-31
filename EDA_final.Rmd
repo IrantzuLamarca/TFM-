@@ -1,0 +1,2576 @@
+---
+title: "EDA_features"
+author: "Irantzu Lamarca"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# EDA, modeling and interpretability for TFM
+
+## Introduction
+
+The purpose of this project is to investigate how acoustic and perceptual features of music relate to emotional moods. This  document reports the full exploratory stage of the analysis. First, the dataset is analyzed in general with descriptive summaries and visualizations of its structure. Data quality is then assessed by checking for missing values, duplicates, and inconsistencies. Outlier detection is performed on both Mel-spectrogram and audio-derived variables, followed by normalization using z-scores. The document also explores univariate distributions of features, computes correlations among numerical variables, and analyzes categorical variables like mood tags. Together, these steps provide a comprehensive overview of the dataset, clarify its limitations, and prepare it for subsequent feature extraction and modeling. After the modeling, several feature interpretation plots are computed. 
+
+## Libraries 
+
+These are all the libraries used in the proyect. 
+
+```{r}
+
+library(tidyverse)
+library(skimr)
+library(DataExplorer)
+library(GGally)
+library(corrplot)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggcorrplot)
+library(e1071)
+library(reshape2)
+library(purrr)
+library(readr)
+library(rstatix)
+library(tidymodels)
+library(themis)
+library(yardstick)
+library(workflows)
+library(recipes)
+library(vip)
+library(fastshap)
+library(shapviz)
+library(patchwork)
+```
+
+## Uploading dataset
+```{r}
+
+df <- read_csv("df_con_duration.csv")
+
+View(df)
+```
+
+## General analysis of the dataset
+
+First, we will focus only on the mood/theme tags, selecting these labels together with the numerical features, while discarding the instrument and genre tags. 
+
+```{r}
+
+df <- df |> select(track_id:key_estimate, DURATION)
+
+View(df)
+```
+
+We will check for dimensions. 
+
+```{r}
+# Dimensions
+dim(df)
+```
+
+
+```{r}
+glimpse(df)
+```
+
+The dataset contains 6,913 rows, where each row represents a different audio track. In total, there are 47 columns: These include features related to timbre (MFCC coefficients 0 to 19), as well as spectral and temporal properties (centroid, rolloff, rms, novelty, or spectral_flux). There are also variables that capture rhythmic and tonal aspects, such as tempo in bpm, the number of onsets per second, or the estimated key. Columns from tag1 to tag8 represent the mood labels inferred for each song.
+
+At first glance, some issues arise:
+- tempo_bpm is stored as text (between brackets), so it should be converted into a numeric format.
+- Label columns from tag4 to tag8 are almost empty, raising questions about their usefulness.
+- Variables such as temporal_centroid_x and temporal_centroid_y may be redundant, so it is important to verify whether they are correlated or even duplicated.
+- Variables like track_id and carpeta appear as numeric, but they are actually identifiers of the audio tracks, so they should be treated as character variables.
+- Convert key_Estimate into a factor.
+- Remove tag8, since it is completely empty.
+- Scale temporal_centroid_x and temporal_centroid_y.
+
+Before proceeding with the analysis of variable types, we will fix these issues.
+
+```{r}
+
+# Convert tempo_bpm into numeric
+df <- df %>%
+  mutate(tempo_bpm = str_remove_all(tempo_bpm, "\\[|\\]")) %>%
+  mutate(tempo_bpm = as.numeric(tempo_bpm))
+
+```
+
+```{r}
+# Convert into character
+df$track_id <- as.character(df$track_id)
+df$carpeta <- as.character(df$carpeta)
+
+# Convert into factor
+df$key_estimate <- as.factor(df$key_estimate)
+
+```
+
+
+```{r}
+# Scale temporal_centroid_x
+df <- df %>%
+  mutate(temporal_centroid_x = temporal_centroid_x / DURATION)
+
+```
+
+```{r}
+# Statistical summary
+summary(df)
+
+# Complete statistical profile
+skim(df)
+```
+
+MFCC:
+- Show considerable variability.
+- mfcc_0 has a mean of -128.5 and a very wide range (from -326 to -10.7), which is expected since this coefficient usually captures the overall energy of the audio. It indicates the presence of extreme values that could distort the analysis.
+- Other coefficients such as mfcc_2, mfcc_13, or mfcc_17 contain both negative and positive values, suggesting good diversity in the timbral qualities of the tracks.
+- Different MFCCs have very different magnitudes, we should consider scaling.
+
+Spectral and temporal variables:
+- centroid: shows variability--> mean around 2407 Hz, but with a range from 425 to 7087 Hz, reflecting a mix of rather low-frequency sounds and much brighter ones.
+- rolloff: wide variability --> range from 601 to 9327 Hz, consistent with its role in measuring accumulated energy. Shows significant diversity in the harmonic content of the dataset.
+- temporal_centroid_x: median values close to 0, but with wide negative and positive tails, which may reflect asymmetric temporal patterns in energy distribution.
+- spectral_flux: highly positively skewed values (maximum ~13.3), indicating that some tracks show substantial spectral variation.
+
+Rhythm and tonal variables:
+- tempo_bpm: some tracks have a tempo of 0 bpm, which seems suspicious and needs to be analyzed (could be detection errors).
+- onsets_per_sec: mean 4.2, median 4, suggesting most tracks have a moderate number of rhythmic events per second. Can reach up to 15.8, which indicates that some songs are very rhythmic or percussive, probably from genres such as electronic music or with heavy drumming (could be worth exploring).
+
+Intensity and energy variables:
+- rms, rms_mean, and rms_dynamic_range: values are generally consistent, though some are very close to zero, possibly corresponding to tracks with long silences or even noise (dispersion across songs).
+- loudness_mean_db: mean of -24.6 dB, which makes sense for unmastered audio files. However, minimum values go as low as -60 dB, which are practically inaudible (further analysis).
+
+We will now review the distribution of all numerical variables.
+
+
+```{r}
+plot_intro(df)
+```
+
+Variable types:
+- Continuous (83%): consistent with the dataset, since most columns come from measurements extracted from audio and mel. Preprocessing should focus on standardization to ensure comparability across analyses.
+- Discrete (14.9%): categorical variables such as track_id, carpeta, key_estimate, and the columns tag1 to tag8.
+
+Missing values (NA):
+- Observations with missing data (13.2%) --> these come from the tags, so they are not considered true NA.
+- Columns entirely NA (2.1%) --> corresponds to tag8, which should be removed.
+- Rows without any NA (0%) --> there is no row with complete data across all columns --> this is due to missing tags, but it does not count as missing data in the strict sense.
+
+### Data quality 
+
+#### NA
+```{r}
+# NA per column
+colSums(is.na(df))
+```
+
+```{r}
+# Check how namy tags have useful information
+tag_na_summary <- sapply(df %>% select(starts_with("tag")), function(x) sum(!is.na(x)))
+print(tag_na_summary)
+```
+
+tag1 to tag8:
+- tag1 is complete --> serves as the basis for starting the modeling process.
+- Both tag2 and tag3 also contain a reasonable amount of data --> almost half of the songs have 2 tags, and nearly 20% have 3.
+- From tag4 onwards, and especially in tag6 and tag7, the majority of entries are empty: over 6,800 NAs in a dataset of 6,913 rows.
+- tag8 is completely empty --> remove.
+
+This suggests that only a small portion of the tracks have more than three assigned tags, which is consistent with the dataset documentation: all spectrograms were guaranteed to have at least one tag, but the number of additional tags per song could vary. For this reason, in this initial stage of the analysis, no imputation or modification will be applied to the tags. They are not truly “missing values,” but rather reflect how many labels were originally assigned to each track. Instead of treating them as missing data, we will first work with tag1 for modeling. 
+
+That being said, there is one clear exception: tag8. This column does not contain any labels at all; it is completely empty. Therefore, the only action at this stage will be to remove this variable, as it does not contribute any value to the analysis.
+
+```{r}
+df <- df %>% select(-tag8) # remove tag8
+```
+
+#### Duplicates
+
+```{r}
+
+sum(duplicated(df$track_id))
+
+```
+
+There are no duplicates, so in this regard, there are no issues.
+
+We want to know which columns do not provide value and could be removed so we will compute a verification of variables with zero or near-zero variance. 
+
+```{r}
+near_zero_var <- df %>% summarise_all(~n_distinct(.)) %>% pivot_longer(everything()) %>% filter(value <= 1)
+print(near_zero_var)
+
+```
+
+0 rows, so none of the columns have zero variance, meaning that all columns contain at least two distinct values.
+There are no constant variables or completely empty columns so there are no trivial variables.
+
+### Outliers
+
+We will separate the features extracted directly from the audio and those derived from the spectrograms, since their ranges, units, and behavior are not directly comparable. Therefore, it is better to analyze them separately.
+
+#### Mel outliers
+
+First, we select the variables derived from the Mel-spectrograms.
+
+```{r}
+mel_vars <- df %>%
+  select(mfcc_0:attack_decay_slope)
+```
+
+```{r}
+summary(mel_vars)
+```
+
+This has already been mentioned earlier, but it is worth highlighting again that:
+
+One of the first things that stands out when exploring the numerical variables of the dataset, as previously mentioned, is the large variability shown by some of them. These wide ranges, compared to their medians or intermediate percentiles, suggest high dispersion in the data and the possible presence of outliers. However, this is not necessarily a problem, as it may simply reflect the diversity of musical styles and characteristics of the analyzed audio tracks.
+
+In addition, when comparing the means and medians of several variables, clear signs of skewness can be observed in their distributions. For example, in mfcc_0, the mean is -128 while the median is -121, and a similar situation occurs with mfcc_1, where the mean is 51 and the median 48. Variables such as centroid and rolloff also show this type of asymmetry. Such skewed distributions (either left or right) should be taken into account, especially if later models assuming normality are to be applied, such certain regression methods.
+
+Next, we will analyze histogram distributions with the goal of identifying possible anomalies, asymmetries, or the need for transformations.
+
+```{r}
+mel_vars %>%
+  gather(variable, valor) %>%
+  ggplot(aes(x = valor)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal()
+
+```
+
+Transform var_energy with log1p to reduce skewness and the influence of extreme values:
+- Most var_energy values are concentrated between 0–500, but there is a very long tail extending beyond 4000.
+- Positive skew --> statistical models may be disproportionately affected by a few very high values.
+
+```{r}
+df <- df %>%
+  mutate(var_energy = log1p(var_energy))
+
+```
+
+```{r}
+# Check for the changes in var_energy
+ggplot(df, aes(x = var_energy)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of var_energy (log-transformed)",
+    x = "var_energy (log1p)",
+    y = "Frequency"
+  )
+
+```
+
+In general, several variables show symmetric and well-defined distributions, which is favorable for use in statistical models that assume normality.
+
+MFCCs:
+- Most present symmetric distributions centered near 0.
+- mfcc_0 is an exception as it is shifted toward negative values with a much wider range, which confirms its role as a descriptor of overall energy.
+- Some coefficients (mfcc_4, mfcc_6) display longer tails --> presence of outliers.
+
+Spectral variables:
+- Centroid and rolloff display bell-shaped distributions, with slight skewness but without extreme tails as pronounced as in other variables. Centroid has an approximately normal distribution; most values fall between 1500 and 3500 Hz, a typical range for music with a balanced frequency mix. Although some outliers exist above 6000 Hz, these may correspond to recordings with strong high-frequency components (such as cymbals or synthesizers) and are not considered errors. Rolloff also shows a reasonable distribution, with slight positive skew. The modal value lies around 4700–5000 Hz, with most observations concentrated between 3000 and 6500 Hz. While some values appear close to 9000 Hz and others below 1000 Hz, these are consistent with different types of sonic textures. A low rolloff may be associated with ambient or minimalist music, whereas a high rolloff is typical of brighter sounds. Therefore, this variable does not require immediate modification.
+- Spectral_flux and novelty show notable positive skew, with most values concentrated at the lower end and a long right tail.
+
+Dynamics and richness variables:
+- Richness is relatively symmetric and bounded, with few extreme values.
+- Attack_decay_slope is clearly right-skewed, with most values low and a long tail extending up to 0.4.
+- Rms also shows positive skew.
+
+var_energy:
+- Before --> extremely skewed distribution, with most values clustered near zero and a small group of very large outliers.
+- After transformation --> distribution becomes much more symmetric, though not perfectly normal --> the right tail is compressed, reducing the influence of extreme values, while small values (<1) are slightly expanded, improving differentiation between low-energy observations.
+
+Overall, the variables extracted from the Mel-spectrogram show good quality for analysis, with no evidence of structural errors such as negative values in frequency measures. To better assess outliers, we will now visualize the boxplots.
+
+
+```{r}
+# Select variables
+mel_vars <- df %>%
+  select(mfcc_0:attack_decay_slope) %>%
+  select(where(is.numeric))
+
+# Pivot longer
+vars_mel_long <- mel_vars %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor")
+
+# Boxplots 
+ggplot(vars_mel_long, aes(x = variable, y = valor)) +
+  geom_boxplot(outlier.color = "red", fill = "lightblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Boxplots - Mel Spectrogram variables", x = "Variable", y = "Value")
+
+```
+
+The variables have very different scales, and in most of them outliers are not clearly visible; at first glance, centroid and rolloff stand out the most. To address this, we will apply Z-score normalization to homogenize the scale of all variables before continuing the analysis, and then we will re-visualize the boxplots.
+
+```{r}
+# Scale with Z-score (mean 0, sd 1)
+mel_scaled <- df %>%
+  mutate(across(c(mfcc_0:attack_decay_slope), scale))
+
+```
+
+We will compute some statistical metrics after normalization for ensuring that the Z-score transformation has worked (mean 0, sd 1).
+
+For understanding the shape of the other variables:
+- skew > 1 or < -1 --> highly skewed distribution.
+- kurtosis > 3 --> heavy tails (many outliers).
+
+```{r}
+
+mel_scaled %>%
+  select(mfcc_0:attack_decay_slope) %>%
+  summarise_all(list(
+    media = mean,
+    sd = sd,
+    skew = ~skewness(.),
+    kurt = ~kurtosis(.)
+  ))
+```
+
+Successful transformation:
+- Means close to 0.
+- Standard deviations = 1.
+- All variables are now on a comparable scale for subsequent analyses.
+
+Skewness:
+- Signs of non-normal distributions in some variables.
+- Most MFCCs have skew values between -1 and 1 --> moderately symmetric distributions.
+- Spectral_flux (1.13), novelty (1.13), and attack_decay_slope (1.10) (possibly also richness with 0.99) show elevated positive skewness, indicating long right tails, though not extremely prominent.
+
+Kurtosis:
+- Temporal_centroid_x (3.3), spectral_flux (3.2), novelty (3.2), richness (3.8), and mfcc_18 (3.7) all display heavier tails than usual.
+- Some variables have strongly skewed structures or heavy tails, which could negatively affect later modeling.
+
+We now analyze the boxplots after scaling.
+
+```{r}
+# Pivot longer
+mel_scaled_long <- mel_scaled %>%
+  select(c(mfcc_0:attack_decay_slope)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Valor")
+
+# Boxplots
+ggplot(mel_scaled_long, aes(x = Variable, y = Valor)) +
+  geom_boxplot(outlier.colour = "red") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Boxplots - Mel Spectrogram variables (Z-score)",
+       x = "Variable", y = "Value")
+
+```
+Outliers appear in almost all variables, although with varying intensity.
+
+Box width (IQR):
+- Wider (greater internal variability): var_energy (widest), followed by rolloff and rms.
+- Intermediate: spectral_flux, novelty, and several mid-range MFCCs (approximately mfcc_3–mfcc_9).
+- Narrower (more stable): temporal_centroid_x, richness, attack_decay_slope, and higher-order MFCCs (mfcc_15–mfcc_19).
+
+Skewness (asymmetry) based on outlier distribution:
+- Strong right tail: var_energy, spectral_flux, novelty, rms, rolloff --> many outliers on the right side, farther from the box compared to the left.
+- More balanced (tails on both sides): most MFCCs (especially mfcc_3–mfcc_9), with moderate outliers on both sides.
+- Left-skewed outliers in specific MFCCs: a few very negative, isolated outliers in certain coefficients (mfcc_18 and some mid/low ones like mfcc_4 and mfcc_6), rare but distant.
+
+Median position (line inside the box):
+- Median slightly > 0: var_energy, rms, rolloff, spectral_flux, novelty (consistent with right skewness).
+- Median close to 0: most MFCCs.
+- Median < 0: mfcc_0, centroid, attack_decay_slope.
+
+Density and extent of outliers:
+- Highest density and range: var_energy (extreme high values), spectral_flux and novelty (clusters of outliers to the right), rms/rolloff (multiple right-sided outliers).
+- Moderate: mid-range MFCCs.
+- Low: richness, attack_decay_slope, higher MFCCs (short tails and few extreme points).
+
+In many cases, values with Z-scores above ±3 are observed, indicating considerable deviation from the mean. This behavior is especially evident in variables such as rms, richness, spectral_flux, novelty, and centroid, where some values exceed Z-scores of 10, which is indicative of extremely high dispersion.
+
+Although MFCC coefficients also present outliers, these tend to be more contained, with Z-scores generally within the range of +-5 to +-10. Even so, their presence suggests that, even within seemingly more homogeneous variables, cases that deviate significantly from the center of the distribution still persist.
+
+Although we think that those are normal characteristics of different audios tracks, it is important to note that the persistence of these outliers could negatively impact statistical models sensitive to extreme values. Therefore, we will detect and flag the outliers.
+
+```{r}
+# Mark outliers by variable: z > 3 or z < -3
+outliers_mel <- mel_scaled %>%
+  select(c(mfcc_0:attack_decay_slope)) %>%
+  mutate(across(everything(), ~ abs(.) > 3, .names = "{.col}_outlier"))
+
+outliers_mel
+
+# See how many there are per variable
+colSums(outliers_mel)
+
+```
+
+```{r}
+# Rewrite table for better understanding
+# Total number of records
+n_total <- nrow(df)
+
+# Calculate number and percentage of outliers per variable
+outlier_summary_mel <- outliers_mel %>%
+  select(ends_with("_outlier")) %>%
+  colSums() %>%
+  tibble(variable = names(.), n_outliers = .) %>%
+  mutate(
+    variable = str_replace(variable, "_outlier", ""),
+    perc_outliers = round((n_outliers / nrow(df)) * 100, 2)
+  ) %>%
+  arrange(desc(n_outliers))
+
+print(outlier_summary_mel)
+
+
+```
+
+#### Audio outliers
+
+First, we select the variables extracted directly from the raw audio.
+
+```{r}
+vars_audio <- df %>%
+  select(tempo_bpm:key_estimate)
+```
+
+
+```{r}
+summary(vars_audio)
+```
+
+tempo_bpm:
+- Wide range: from 0.00 to 304.00 BPM.
+- A BPM value of 0 is unusual (likely a detection error or long silences) --> should be analyzed.
+- Very high values (close to 300) are uncommon in regular music but not necessarily errors.
+- Median at 120.19 BPM --> typical of popular music.
+- Distribution centered around 117–120 BPM, but with long tails.
+
+onsets_per_sec:
+- Maximum 15.8 --> possible in highly rhythmic genres or those with intense percussion.
+- No problematic values identified, though reviewing outliers would be advisable.
+- Median 4, interquartile range between 2.63 and 5.36.
+
+rms_mean:
+- Values range from approximately 0 to 0.71.
+- Low mean (0.12) --> expected in normalized files.
+- No evident outliers or inconsistencies.
+
+rms_dynamic_range:
+- Narrow range: min 0.00085, max 0.975.
+- No negative values --> correct for this metric.
+- Distribution is fairly symmetric, though the maximum remains slightly below 1.
+- Reflects variability between soft and loud sections of the audio.
+- Values seem reasonable with no visible anomalies.
+
+loudness_mean_db:
+- Highly variable: from -60.03 dB (very quiet) to -8.4 dB (very loud) --> consistent with recordings that are not fully normalized.
+- Median -24 dB, reasonable for music.
+- Manual review is recommended for observations near -60 dB to confirm validity.
+
+temporal_centroid_y:
+- Range: 367.4 to 2275.7.
+- Median 1147.2, with IQR centered around 1135–1156.
+- Low and high extremes appear to be isolated cases, possibly reflecting very short or very long clips in perceived duration.
+- No anomalous or out-of-context values detected.
+
+key_estimate:
+- Mostly categorical values (numbers representing musical key classes).
+- Mode is key 0 (1134 records), followed by key 9 (891 records).
+- Uneven distribution --> some keys are overrepresented.
+
+General conclusion:
+Among all analyzed variables, only tempo_bpm shows a potentially erroneous value (0 BPM). Additionally, extreme values in loudness_mean_db (-60 dB) may be linked to silent files or low-quality recordings. The remaining variables behave as expected, with no evidence of systematic errors or values requiring immediate transformation.
+
+We now move on to histograms.
+
+```{r}
+
+vars_audio %>%
+  select(where(is.numeric)) %>%  
+  pivot_longer(everything(), names_to = "variable", values_to = "valor") %>%
+  ggplot(aes(x = valor)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 5) +
+  theme_minimal()
+
+
+```
+
+```{r}
+ggplot(df, aes(x = key_estimate)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Key Estimate distribution", x = "Tonality (0–11)", y = "Frequency")
+
+```
+Several varied patterns can be observed, reflecting both the nature of the data and potential issues with feature extraction or normalization. Overall, most variables behave as expected. Some require minor revisions, particularly those with extreme values that could distort models sensitive to outliers or scale differences.
+
+loudness_mean_db
+- Approximately normal-shaped distribution, but shifted toward negative values (expected for decibels).
+- Slightly right-skewed, with a few extreme values near -60 dB.
+- Most values fall between -35 dB and -15 dB.
+
+onsets_per_sec
+- Unimodal distribution centered between 3 and 5 onsets per second.
+- Slight right skew, with some outliers above 12–13.
+- Most tracks have moderate rhythmic densities, but a few are very fast-paced.
+
+rms_dynamic_range
+- Bell-shaped, though somewhat flattened (low kurtosis).
+- Centered around 0.3, with light tails toward 0 and 0.75.
+- Suggests that most tracks have a relatively stable dynamic range.
+
+rms_mean
+- Fairly concentrated distribution between 0 and 0.25, with a short right tail up to 0.45.
+- Slight positive skew.
+- Indicates that the average energy level is low in most tracks.
+
+tempo_bpm
+- Bimodal shape: a strong peak around 120 BPM and a smaller one around 60 BPM.
+- Long tails on the left (values near 0) and right (up to 300 BPM).
+
+temporal_centroid_y
+- Unimodal distribution centered around 1400–1500, with slight right skew.
+- Extreme values at 500 and 2250, indicating tracks with very early or very late energy peaks.
+
+key_estimate
+- Heterogeneous categorical distribution.
+- Key 0 (C) is the most frequent, followed by keys such as 4, 9, and 7.
+
+The variable temporal_centroid_y represents the temporal point where the total energy of the audio is concentrated. Unlike temporal_centroid_x, this variable is based on overall energy (RMS). Therefore, its scale is directly influenced by the duration of the clip. If tracks have very different lengths, this value will naturally be larger in longer tracks, even if their energy behavior is otherwise similar.
+
+
+```{r}
+# Statistical summary of duration
+dur_stats <- df %>%
+  summarise(
+    min_duration  = min(DURATION, na.rm = TRUE),
+    q1_duration   = quantile(DURATION, 0.25, na.rm = TRUE),
+    median_duration = median(DURATION, na.rm = TRUE),
+    q3_duration   = quantile(DURATION, 0.75, na.rm = TRUE),
+    max_duration  = max(DURATION, na.rm = TRUE),
+    mean_duration = mean(DURATION, na.rm = TRUE),
+    sd_duration   = sd(DURATION, na.rm = TRUE),
+    coef_var_pct  = sd_duration / mean_duration * 100
+  )
+dur_stats
+```
+
+Since there are significant differences in track duration (CV > 70%, with a range of up to nearly one hour), we will normalize this variable to a relative scale (0–1) by dividing by the total duration of each track. This will prevent longer tracks from appearing to have artificially larger centroids simply due to their length.
+
+```{r}
+# Conversion factor k 
+k_hat <- median(df$temporal_centroid_y / df$DURATION, na.rm = TRUE)
+
+# Scale [0,1] 
+df <- df %>%
+  mutate(temporal_centroid_y_norm = temporal_centroid_y / (DURATION * k_hat))
+
+summary(df$temporal_centroid_y_norm)
+
+```
+
+```{r}
+cor(df$temporal_centroid_y,     df$DURATION, use = "complete.obs")  # before: high correlation
+cor(df$temporal_centroid_y_norm, df$DURATION, use = "complete.obs")  # after: correlation goes down
+
+```
+
+This transformation converts the measure into a relative position within the [0, 1] range, allowing for a fair comparison between short and long clips.
+
+The correlation with duration, which was previously 0.115, changes to -0.573 after normalization, confirming that the direct dependence on duration has been reduced and that the metric now better reflects the relative moment at which the energy is concentrated.
+
+```{r}
+# Replace temporal_centroid_y with the normalized value and delete the normalized value
+df <- df %>%
+  mutate(temporal_centroid_y = temporal_centroid_y / (DURATION * k_hat))
+
+df <- df %>%
+  select(-temporal_centroid_y_norm)
+```
+
+Let's check loudness audio tracks in order to make sure that there are no errors. 
+
+```{r}
+df %>% 
+  filter(loudness_mean_db < -45)
+
+```
+
+Since nothing unusual can be detected by simple listening, we will separate the tracks with abnormal loudness into a new variable. In other words, we will create a new binary variable (is_extreme_loudness) indicating whether an observation shows an abnormally low loudness level.
+
+```{r}
+df <- df %>%
+  mutate(loudness_extreme = loudness_mean_db < -45)
+
+```
+
+
+onsets_per_sec:
+- As previously mentioned, there are cases exceeding 10 or even 15 --> these values may be real (in tracks with very marked or percussive rhythms), but they could also result from over-detections by the algorithm.
+- Technical perspective: in music at 120 BPM with 4 beats per bar, the estimated number of onsets per second would be approximately 2. Even with fast subdivisions, a value of 8–10 onsets per second already corresponds to very dense rhythmic structures.
+- Values above 12 onsets per second should be carefully reviewed, as they may reflect either genuine musical content or processing errors.
+
+We will review them manually to ensure there are no issues.
+
+```{r}
+df %>% 
+  arrange(desc(onsets_per_sec)) %>% 
+  select(track_id, carpeta, onsets_per_sec) %>% 
+  head(20)
+
+```
+
+It has been confirmed that the high values appear to be processing errors, so we will remove them to avoid future issues.
+
+Remove observations with onsets_per_sec greater than 12.
+
+```{r}
+# Count how many tracks with onsets >12
+df %>% 
+  filter(onsets_per_sec > 12) %>% 
+  count()
+
+# Remove onsets >12
+df <- df %>% 
+  filter(onsets_per_sec <= 12)
+
+```
+
+tempo_bpm
+- Peaks, especially between 90 and 130 BPM --> typical of many musical genres.
+- Small number of extremely low values, including some equal to 0 BPM --> this value makes no sense from a musical perspective and likely indicates a tempo detection error, caused by tracks with little rhythmic content, silence, or processing errors.
+- From both a musical and psychometric standpoint, these extreme values can distort statistical analyses, negatively affect machine learning models, and hinder interpretations linking tempo to psychological dimensions such as emotional arousal.
+- Various sources, including specialized libraries such as Essentia, literature in music psychology, and reference datasets like GTZAN or FMA, agree that the most common tempo values fall between 40 and 200 BPM. Values below 40 BPM typically correspond to detection errors or non-musical files, while those above 200 BPM often result from misinterpretations of tempo (reading the double pulse).
+
+We will first review these cases individually.
+
+```{r}
+# audios with tempo bpm = 0 
+df %>% 
+  filter(tempo_bpm == 0)
+
+```
+
+We have confirmed that none of the audio files are defective, so we will create a new variable that divides the tracks into those with common tempos and those with irrational tempos.
+
+```{r}
+# Label faulty and non-faulty tempos
+df <- df %>%
+  mutate(tempo_faulty = tempo_bpm < 40 | tempo_bpm > 200)
+
+```
+
+Remove tempo = 0. 
+
+```{r}
+df %>% filter(tempo_bpm == 0) %>% count() # Count how many
+
+df <- df %>% filter(tempo_bpm != 0) # Remove
+
+```
+
+Next, their distributions will be analyzed using boxplots to more clearly observe the presence of outliers.
+
+
+```{r}
+vars_audio %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor") %>%
+  ggplot(aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Boxplots - Audio variables")
+
+
+```
+
+Z-score normalization will be applied to all continuous numerical variables (excluding key_estimate) in order to allow fairer comparisons between variables of different scales and to facilitate multivariate analyses. Once the transformations are applied, we will plot the boxplots again to evaluate the presence of outliers on the relative scale and to detect potential influential values for subsequent analyses. 
+
+```{r}
+# select audio variables (excluding key_estimate)
+vars_audio_num <- c("tempo_bpm", "onsets_per_sec", "rms_mean",
+                "rms_dynamic_range", "loudness_mean_db", "temporal_centroid_y")
+
+# Scale with Z-score
+vars_audio_scaled <- df %>%
+  mutate(across(all_of(vars_audio_num), ~ as.numeric(scale(.))))
+```
+
+```{r}
+# Skewness, kurtosis, etc...
+
+audio_stats <- vars_audio_scaled %>%
+  select(all_of(vars_audio_num)) %>%
+  tidyr::pivot_longer(cols = everything(),
+                      names_to = "variable",
+                      values_to = "valor") %>%
+  group_by(variable) %>%
+  summarise(
+    media = mean(valor, na.rm = TRUE),
+    sd    = sd(valor, na.rm = TRUE),
+    skew  = skewness(valor, na.rm = TRUE),
+    kurt  = kurtosis(valor, na.rm = TRUE, type = 1),
+    .groups = "drop"
+  )
+
+audio_stats
+```
+
+Mean 0 and standard deviation = 1 across all variables, so standardization is applied correctly.
+
+Skewness:
+- Values close to 0 (onsets_per_sec, rms_dynamic_range, tempo_bpm) --> approximately symmetric distributions.
+- loudness_mean_db --> moderate negative skew (-0.89) --> longer tail toward lower values.
+- rms_mean --> moderate positive skew (1.04) --> tail toward higher values.
+- temporal_centroid_y --> stands out with high skewness (2.47) -->  strongly right-skewed distribution (long tail in higher values).
+
+Kurtosis:
+- Values close to 0 or 3 indicate tails similar to a normal distribution.
+- rms_dynamic_range has negative kurtosis (-0.37) --> lighter tails (fewer extreme outliers).
+- loudness_mean_db (2.31), rms_mean (1.90), and tempo_bpm (1.82) fall slightly below 3 --> somewhat lighter tails than a normal distribution.
+- temporal_centroid_y stands out with very high kurtosis (7.04) --> very heavy tails, presence of extreme outliers.
+
+We will now analyze the boxplots.
+```{r}
+
+vars_audio_scaled %>%
+  select(all_of(vars_audio_num)) %>%
+  tidyr::pivot_longer(cols = everything(),
+                      names_to = "variable",
+                      values_to = "valor") %>%
+  ggplot(aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Boxplots - Audio variables (Z-score)")
+
+```
+
+temporal_centroid_y
+- Narrow box with many outliers, especially on the positive side.
+- This is consistent with the high positive skewness (skew = 2.47) and elevated kurtosis (7.04) --> very heavy tails and extreme high values.
+
+tempo_bpm
+- Box centered near 0 but with many extreme positive values.
+- Some tracks are much faster compared to the average, although the overall distribution is less skewed than in temporal_centroid_y.
+
+rms_mean
+- Its skew = 1.04 confirms this slight upward asymmetry.
+- rms_dynamic_range and onsets_per_sec
+- Few extreme values, most within ±3 z-scores.
+
+Variables with more compact distributions, closer to normality.
+
+loudness_mean_db
+- Clear negative skew: many outliers on the left side (low loudness values in dB, i.e., tracks quieter than usual).
+
+Instead of directly removing these outliers, a useful alternative is to flag them in a new column. This approach preserves the complete information while identifying the cases that could disproportionately influence sensitive models such as linear regression. This strategy makes it easier to handle them later, whether by filtering, adjusting, or analyzing them as potential anomalies within the dataset.
+
+```{r}
+# Create dataframe with outlier flags
+outliers_audio <- df %>%
+  select(all_of(vars_audio_num)) %>%
+  mutate(across(everything(), ~ abs(scale(.)) > 3, .names = "{.col}_outlier"))
+
+# See how many there are per variable
+colSums(outliers_audio)
+
+```
+
+```{r}
+# Rewrite table for better understanding
+# Total number of records
+n_total <- nrow(df)
+
+# Calculate number and percentage of outliers per variable
+outlier_summary_audio <- outliers_audio %>%
+  select(ends_with("_outlier")) %>%
+  colSums() %>%
+  tibble(variable = names(.), n_outliers = .) %>%
+  mutate(
+    variable = str_replace(variable, "_outlier", ""),
+    perc_outliers = round((n_outliers / nrow(df)) * 100, 2)
+  ) %>%
+  arrange(desc(n_outliers))
+
+print(outlier_summary_audio)
+```
+
+
+## Bivariate analysis
+
+### Correlations between numerical variables
+
+We will divide the analysis into three groups to make it easier to interpret. On one hand, the variables extracted from the Mel-spectrograms will be analyzed in two subgroups: the MFCCs and the remaining features. Then, in a separate group, we will analyze the audio-derived variables.
+
+We will first define variable groups.
+```{r}
+# MFCC 
+mfcc_vars <- df %>% select(mfcc_0:mfcc_19)
+
+# Mel Spectrogram 
+mel_vars <- df %>% select(centroid:attack_decay_slope)
+
+# Audio 
+audio_vars <- df %>% select(tempo_bpm, onsets_per_sec, rms_mean, rms_dynamic_range, loudness_mean_db, temporal_centroid_y)
+
+```
+
+#### MFCCS correlations
+
+```{r}
+
+# Select numeric variables
+num_vars <- df %>% select(where(is.numeric))
+
+# Correlation matrix
+cor_mfcc_vs_all <- cor(mfcc_vars, num_vars, use = "complete.obs")
+
+# Convert to long format for ggplot
+cor_long <- melt(cor_mfcc_vs_all)
+
+# Plot
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 2.5) + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8)) +
+  labs(title = "Correlation: MFCCs vs. all variables", x = "MFCCs", y = "Variables")
+
+```
+
+MFCC_0:
+- Shows moderate positive correlations with many energy and dynamics variables (novelty = 0.72, var_energy = 0.71, richness = 0.74).
+- Strong negative correlation with mfcc_1 (= −0.72).
+- MFCC_0, which usually captures the overall spectral envelope, presents a distinct correlation pattern, being more related to energy and dynamics than to timbre.
+
+Internal patterns among MFCCs
+- Consecutive MFCCs show high correlations with each other, especially immediate neighbors (mfcc_5 and mfcc_6 = 0.67) --> ≥ 0.6–0.7 in many pairs.
+- mfcc_1 has a negative correlation with mfcc_0 (−0.72) --> may reflect a timbral pattern inversely related to energy.
+- This is expected because MFCCs are sequentially derived coefficients from the Mel spectrum, so redundancy is inherent.
+- High multicollinearity --> for modeling or dimensionality reduction it could be useful to apply PCA or some variable selection method to avoid redundancies.
+
+MFCCs and spectral/temporal variables
+- Negative correlations between mfcc_1 and measures such as centroid (= −0.64) and rolloff (= −0.78), indicating an energy shift toward lower frequencies when mfcc_1 is high.
+- Intermediate MFCCs (mfcc_4–mfcc_8) show moderate positive correlations with centroid, rolloff, and spectral_flux (= 0.41) --> reflect timbral components related to spectral content.
+
+External variables with strong connections
+- rms, novelty, and spectral_flux appear as “central nodes” correlating with several MFCCs --> possible representative variables if dimensionality reduction is applied.
+- rolloff and centroid have more modest correlations with most MFCCs --> add complementary information.
+
+Nearly independent variables
+- tempo_bpm, temporal_centroid_x, temporal_centroid_y, and onsets_per_sec have very low correlations with almost all MFCCs (< 0.3) --> global rhythmic information is not directly captured by MFCCs.
+
+
+#### MEL SPECTROGRAM correlations
+
+```{r}
+# Mel Spectrogram vars vs all
+cor_mel_vs_all <- cor(mel_vars, num_vars, use = "complete.obs")
+cor_mel_long <- melt(cor_mel_vs_all)
+
+ggplot(cor_mel_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 2.5) + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8)) +
+  labs(title = "Correlation: mel vs all", x = "mel", y = "Variables")
+```
+
+Very high internal correlations
+- centroid and rolloff: almost perfect correlation (r = 0.93) -->  both measure brightness/high spectral content -->  redundant to keep both --> retain only one (centroid is usually more interpretable).
+- rms, novelty, spectral_flux, and var_energy --> very high correlations among them (≥ 0.77–0.92) --> all measure energy and dynamic variations over time, so they could act as proxies for each other --> reduce this group to 1–2 representative variables to avoid multicollinearity.
+
+Strong connections with external variables
+- richness has high correlations with var_energy (0.89), rms (0.86), novelty (0.87), and spectral_flux (0.87) --> highly associated with energy dynamics rather than pure timbral changes --> possible information overlap.
+- mfcc_0 correlates moderately with many Mel variables (var_energy 0.71, spectral_flux 0.74), reinforcing that it is more linked to energy than timbre.
+
+Almost independent variables
+- Most MFCCs have low correlations (< 0.3) with the Mel variables, except for some intermediate coefficients (mfcc_5–mfcc_9), which rise to 0.4 with spectral_flux or attack_decay_slope --> Mel variables provide complementary information to the MFCC block (lower redundancy risk).
+
+If we had to remove some variables by hand and by their definitions, taking into account these correlation, we would save: 
+- Between centroid and rolloff --> keep centroid: Centroid is more intuitive and widely used as a general timbral descriptor
+- Among rms, novelty, spectral_flux, var_energy, and richness --> keep 1–2 --> 
+    - RMS: measures average energy (similar to loudness) --> most comprehensive, since var_energy and spectral_flux measure changes, not absolute energy.
+    - Var_energy: reflects how total intensity fluctuates --> complements RMS by adding the dynamic pattern.
+    - Richness: the only one in the group that directly describes timbral complexity, complementing RMS and var_energy -> provides a unique dimension (static timbre), easy to interpret, and avoids duplicating information with var_energy.
+    - Exclude spectral_flux and novelty --> although useful for detecting events, they add less global interpretability compared to the three chosen variables.
+    - The three selected variables (RMS, Var_energy, Richness) cover three orthogonal and easily interpretable dimensions: Average loudness – Temporal dynamics – Timbral complexity.
+    
+However, we will apply some methods later on in order to select the variables that do not correlate between them. 
+
+#### AUDIO correlations
+
+```{r}
+cor_audio_vs_all <- cor(audio_vars, num_vars, use = "complete.obs")
+cor_audio_long <- melt(cor_audio_vs_all)
+
+ggplot(cor_audio_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 2.5) + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8)) +
+  labs(title = "Correlations: audio vs all", x = "audio", y = "Variables")
+```
+
+tempo_bpm
+- Very low correlations with almost everything --> captures global rhythmic information --> remains independent
+
+onsets_per_sec
+- Low to moderate correlations with “change” metrics such as novelty, spectral_flux, and with attack_decay_slope --> provides a rhythmic nuance complementary to tempo_bpm and average energy
+
+rms_mean
+- High correlation with rms_dynamic_range (0.79).
+- Moderate–high correlations with loudness_mean_db (0.68) and with change/energy metrics (novelty, spectral_flux, var_energy, richness).
+- Energy node: a good candidate to remain as a representative of “average level.”
+
+rms_dynamic_range
+- Aligned with rms_mean and also with novelty/spectral_flux.
+- Captures volume variability --> overlaps considerably with the energy/change block.
+
+loudness_mean_db
+- Measures the same as rms_mean but on a different scale --> redundant.
+
+temporal_centroid_y
+- Very low correlations with almost everything --> provides a temporal axis.
+
+If we had to choose just by the definition of the variables we would select to keep:
+1. tempo_bpm → covers the rhythmic dimension --> does not overlap with other measures --> easy to interpret --> only variable that represents theoretical tempo.
+2. rms_dynamic_range --> variability of volume over time (dynamic dimension) --> complements tempo_bpm and is not just an average level like rms_mean or loudness_mean_db.
+3. onsets_per_sec --> indicator of real musical activity --> provides different information from tempo_bpm --> does not correlate with other variables.
+4. loudness_mean_db --> chosen for interpretability --> preferred over rms_mean because it uses the decibel scale, which is more intuitive.
+
+### Analysis of categorical variables
+
+We want to understand:
+- Which tags are most frequent in the dataset.
+- Which tag combinations occur commonly.
+- How many different tags each track has.
+- How certain tags relate to numerical variables (tempo, energy, etc.).
+
+Transform the tags into long format.
+
+
+```{r}
+
+# Move from wide to long format 
+tags_long <- df %>%
+  pivot_longer(cols = starts_with("tag"),
+               names_to = "tag_position",
+               values_to = "tag") %>%
+  filter(!is.na(tag))  
+
+```
+
+Frequency of each tag
+
+```{r}
+tag_counts <- tags_long %>%
+  count(tag, sort = TRUE)
+
+ggplot(tag_counts, aes(x = reorder(tag, n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Tag Frequency", x = "Tag", y = "Number of songs")
+
+```
+
+- Very uneven distribution: a few tags such as happy, film, relaxing, and energetic dominate the dataset, with more than 500 occurrences each.
+- Long tail: many tags appear in fewer than 100 songs, indicating minority classes that could be problematic for modeling.
+- Thematic bias: the most frequent tags tend to describe emotions (happy, emotional, dark) or contextual uses (film, advertising), which may influence predictability.
+- Risk of imbalance: since the goal is to predict tags, it will be necessary to consider techniques for balancing or grouping less frequent labels.
+
+Number of tags per song
+
+```{r}
+# Count the number of non-empty and non-NA tags per song
+df_tags_count <- df %>%
+  mutate(tag_count = rowSums(!is.na(select(., starts_with("tag"))) & select(., starts_with("tag")) != ""))
+
+# Plot
+ggplot(df_tags_count, aes(x = tag_count)) +
+  geom_bar(fill = "#4682B4") +
+  scale_x_continuous(breaks = 1:7) +
+  labs(title = "Distribution of number of tags per song",
+       x = "Number of tags", y = "Number of songs") +
+  theme_minimal()
+
+```
+
+- Predominance of a single tag: most songs (3,400) have only one tag, indicating very sparse labeling.
+- Rapid decline: frequency drops sharply as the number of tags increases; 2 tags is much less common, and more than 4 is rare.
+- Unrepresentative extreme cases: very few songs have between 5 and 7 tags.
+- Implications for modeling: if the goal is multi-label prediction, the dataset is heavily skewed toward single-label cases, which could bias models toward simple classification behavior unless adjustments are made.
+
+Top most frequent tag combinations
+
+```{r}
+
+
+# Long format
+tags_long <- df %>%
+  select(starts_with("tag")) %>%
+  mutate(song_id = row_number()) %>%
+  pivot_longer(cols = starts_with("tag"), names_to = "tag_col", values_to = "tag") %>%
+  filter(!is.na(tag))
+
+# Group by song and create a list of tags for each song
+tags_grouped <- tags_long %>%
+  group_by(song_id) %>%
+  summarise(tags = list(sort(unique(tag))), .groups = "drop")
+
+# Filter songs with at least 2 tags
+tags_grouped <- tags_grouped %>%
+  filter(lengths(tags) >= 2)
+
+# Create unique tag pairs for each song
+tag_pairs <- tags_grouped %>%
+  mutate(pairs = map(tags, ~ combn(.x, 2, simplify = FALSE))) %>%
+  select(pairs) %>%
+  unnest(pairs) %>%
+  mutate(
+    tag1 = map_chr(pairs, 1),
+    tag2 = map_chr(pairs, 2)
+  ) %>%
+  select(tag1, tag2)
+
+# Count occurrences of combinations
+top_tag_pairs <- tag_pairs %>%
+  count(tag1, tag2, sort = TRUE) %>%
+  filter(n >= 10)  
+
+top_tag_pairs
+
+
+```
+
+
+```{r}
+
+# Create combination tag (tag1 - tag2)
+top_tag_pairs <- top_tag_pairs %>%
+  mutate(pair = paste(tag1, tag2, sep = " - "))
+
+# Most frequent combinations
+top_tag_pairs %>%
+  slice_max(n, n = 20) %>%
+  ggplot(aes(x = reorder(pair, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 tag combinations",
+    x = "Tag pairs",
+    y = "Frecuency"
+  ) +
+  theme_minimal()
+
+```
+
+And we will also create a co-ocurrence matrix between the tags in order to be able to group them in bigger groups. 
+```{r}
+
+top_tag_pairs %>%
+  separate(pair, into = c("tag1", "tag2"), sep = " - ") %>%
+  filter(n >= 20) %>%
+  ggplot(aes(tag1, tag2, fill = n)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Co-occurrence of Tags", x = "Tag 1", y = "Tag 2") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+Associations such as “happy – positive”, “happy – uplifting”, and “happy – summer” are the most recurrent, with more than 100 occurrences each. "drama – emotional” or “meditative – relaxing” suggest a strong relationship between moods and musical or narrative styles.
+
+With the heatmap we can observe stronger relationships that are not necessarily in the top 20, which helps us identify thematic clusters.
+
+Some thematic clusters observed:
+- Happy with positive, uplifting, summer
+- Corporate with motivational, advertising
+- Epic with film, trailer
+
+We will now attempt to group the tags to reduce the total number and facilitate dimensionality reduction if needed. Fourteen groups have been created:
+
+```{r}
+# Unique tag list
+unique_tags <- df %>%
+  select(starts_with("tag")) %>%
+  pivot_longer(everything(), names_to = "tag_pos", values_to = "tag") %>%
+  filter(!is.na(tag), tag != "") %>%
+  mutate(tag = str_to_lower(tag),
+         tag = str_trim(tag)) |> 
+  distinct(tag) %>%
+  arrange(tag)
+
+unique_tags
+
+```
+
+These are the groups proposed:
+
+1) Happy --> happy, summer, positive, uplifting, fun, party, funny
+
+2) Energy --> energetic, upbeat, powerful, fast, sport
+
+3) Corporate --> corporate, motivational, advertising, commercial, background, documentary
+
+4) Epic --> epic, film, trailer, action, movie, adventure
+
+5) Relax --> relaxing, soft, meditative, mellow, calm, dream, ballad
+
+6) Inspire --> emotional, inspiring, hopeful
+
+7) Drama --> deep, dramatic, drama
+
+8) Romance --> love, romantic
+
+9) Sadness --> melancholic, sad
+
+10) Dark --> dark, slow, heavy, horror
+
+11) Festive --> christmas, holiday
+
+12) Nature --> nature, space, ambiental, soundscape, travel
+
+13) Style --> retro, groovy, cool, sexy, melodic
+
+14) Kids --> children, game
+
+```{r}
+
+# Define groups 
+groups <- list(
+  Happy   = c("happy","summer","positive","uplifting","fun","party","funny"),
+  Energy  = c("energetic","upbeat","powerful","fast","sport"),
+  Corporate = c("corporate","motivational","advertising","commercial","background","documentary"),
+  Epic    = c("epic","film","trailer","action","movie","adventure"),
+  Relax   = c("relaxing","soft","meditative","mellow","calm","dream","ballad"),
+  Inspire = c("emotional","inspiring","hopeful"),
+  Drama   = c("deep","dramatic","drama"),
+  Romance = c("love","romantic"),
+  Sadness = c("melancholic","sad"),
+  Dark    = c("dark","slow","heavy","horror"),
+  Festive = c("christmas","holiday"),
+  Nature  = c("nature","space","soundscape","ambiental", "travel"),
+  Style   = c("retro","groovy","cool","sexy","melodic"),
+  Kids    = c("children","game"))
+
+```
+
+We will add this grouping to the dataset, but only taking into account tag1.
+
+```{r}
+
+
+# Pass the list to the mapping table 
+map_tbl <- enframe(groups, name = "macro_group", value = "tag") %>%
+  unnest_longer(tag) %>%
+  mutate(tag = str_to_lower(tag))
+
+# arrangement of previous part
+map_tbl <- enframe(groups, name = "macro_group", value = "tag") %>%
+  unnest_longer(tag) %>%
+  mutate(tag = str_to_lower(tag)) %>%
+  distinct(tag, macro_group) %>%
+  rename(macro_group_map = macro_group) 
+
+# Normalize tag1
+df <- df %>%
+  mutate(tag1_clean = tag1 |> str_to_lower() |> str_remove("^mood/theme---"))
+
+# Add macro_group without changing tag1
+df <- df %>%
+  left_join(map_tbl, by = c("tag1_clean" = "tag")) %>%
+  mutate(
+    macro_group = factor(
+      coalesce(macro_group_map, "Other"),
+      levels = c(names(groups), "Other")
+    )
+  ) %>%
+  select(-tag1_clean, -macro_group_map)
+
+# See how many are per group
+df %>% count(macro_group, sort = TRUE)
+```
+
+### Relating tags with numerical variables
+
+We want to determine which numerical variables “align” with the tags (macro_group) in order to include them in the model without noise or duplicates. For that, we will score variables individually with Kruskal’s η² (“Does this variable change across tags?” (0 = no relationship, high = strongly related)). 
+
+What it does: for each numerical variable, it runs a Kruskal-Wallis test against macro_group and calculates the effect size η² (proportion of variance explained by the classes).
+
+Useful guideline for η²: ~0.01 small, ~0.06 medium, ~0.14 large.
+
+We will score correlation with tags first (η²).
+
+```{r}
+# First we need to scale the dataset 
+# Columns that we do not want to scale
+exclude_cols <- c("track_id","carpeta","key_estimate","macro_group",
+                  paste0("tag", 1:7)) 
+ 
+# Scale
+df_scaled <- df %>%
+  mutate(across(
+    .cols = where(is.numeric) & !any_of(exclude_cols),
+    .fns  = ~ as.numeric(scale(.)),
+    .names = "{.col}"
+  ))
+```
+
+```{r}
+
+
+# Choose numeric variables 
+id_cols <- c("track_id","carpeta", "DURATION")  
+num_vars <- df_scaled %>%
+  select(where(is.numeric), -any_of(id_cols)) %>%
+  names()
+
+# Function: η² from Kruskal for each variable vs macro_group
+rank_por_eta2 <- function(df, y, vars){
+  map_dfr(vars, function(v){
+    f <- as.formula(paste(v, "~", y))
+    tibble(
+      variable = v,
+      p_value  = tryCatch(kruskal_test(f, data = df)$p, error = function(e) NA_real_),
+      eta2     = tryCatch(kruskal_effsize(f, data = df)$effsize, error = function(e) NA_real_)
+    )
+  }) %>% arrange(desc(eta2))
+}
+
+eta_tabla <- rank_por_eta2(df_scaled, "macro_group", num_vars)
+
+eta_tabla 
+
+```
+
+We will choose a simple threshold (η² ≥ 0.06 ≈ medium effect) or select the Top K variables. If we select 0.06n as a threshold we do not have enough coverage for the project, so we will keep it at 0.02. 
+
+```{r}
+cand <- eta_tabla %>% filter(eta2 >= 0.02) %>% pull(variable)
+
+length(cand); cand
+
+```
+We now want to remove redundancies among the selected variables (correlation between predictors) using Spearman correlation.
+
+If two variables measure the same thing (|ρ| > 0.85), we will keep the one with the higher η².
+
+```{r}
+
+# Spearman correlation matrix between candidates
+cors <- df_scaled %>% 
+  dplyr::select(dplyr::all_of(cand)) %>% 
+  cor(method = "spearman", use = "pairwise.complete.obs")
+
+# Cleanups to avoid problems
+diag(cors) <- 0
+cors[is.na(cors)] <- 0
+
+# Remove redundancies while maintaining the highest η²
+thr  <- 0.85
+keep <- character(0)
+drop <- character(0)
+
+for (v in cand) {
+  if (v %in% drop) next
+  
+  # compare v with those that are not yet in keep/drop
+  comp <- setdiff(cand, c(keep, drop, v))
+  if (length(comp) == 0) { keep <- c(keep, v); next }
+  
+  rho <- abs(cors[v, comp])
+  altos <- comp[rho > thr]
+  if (length(altos) == 0) { keep <- c(keep, v); next }
+  
+  # of {v + highs} we choose the one with the highest eta²
+  grupo <- c(v, altos)
+  best <- eta_tabla %>% 
+    dplyr::filter(variable %in% grupo) %>% 
+    dplyr::slice_max(eta2, n = 1, with_ties = FALSE) %>%   # avoid ties
+    dplyr::pull(variable)
+  
+  keep <- c(keep, best)
+  drop <- c(drop, setdiff(grupo, best))
+}
+
+features_finales <- unique(keep)
+features_finales
+
+```
+So we already have the variables that we will put in our models. 
+
+## Modeling
+
+Linear baseline – Multinomial logistic regression with elastic-net (glmnet).
+- Pros: fast, stable, easy to explain (coefficients).
+- Cons: only captures linear relationships.
+
+Non-linear – Gradient Boosting (XGBoost).
+- Pros: captures nonlinearities and interactions; often performs better with MFCCs/energy features.
+- Cons: less interpretable (although SHAP values or gain importance can be examined).
+
+**We won't comment on the results of the models as we will do that on the final paper. 
+
+#### Preparation and split
+```{r}
+
+tidymodels_prefer()
+set.seed(123)
+
+# Select data
+datos <- df_scaled %>%
+  dplyr::select(tidyselect::all_of(features_finales), macro_group) %>%
+  dplyr::filter(!is.na(macro_group)) %>%
+  dplyr::mutate(macro_group = factor(macro_group))
+
+# Split + CV 
+split <- initial_split(datos, prop = 0.8, strata = macro_group)
+train <- training(split)
+test  <- testing(split)
+
+folds <- vfold_cv(train, v = 3, strata = macro_group)
+
+# Metrics
+# Macro-avg for multiclass 
+precision_macro <- metric_tweak("precision_macro", precision, estimator = "macro")
+recall_macro    <- metric_tweak("recall_macro",    recall,    estimator = "macro")
+f1_macro        <- metric_tweak("f1_macro",        f_meas,    estimator = "macro", beta = 1)
+
+# With class predictions
+metricas_cls  <- metric_set(accuracy, bal_accuracy, precision_macro, recall_macro, f1_macro)
+
+# Helper for log-loss multiclass 
+log_loss_multiclass <- function(pred_df, truth = macro_group){
+  lvls <- levels(dplyr::pull(pred_df, {{ truth }}))
+  prob_cols <- intersect(paste0(".pred_", lvls), names(pred_df))
+  yardstick::mn_log_loss(pred_df, truth = {{ truth }}, !!!rlang::syms(prob_cols))
+}
+```
+
+#### Multinomial glmnet 
+```{r}
+
+# GLMNET multinomial
+rec_glm <- recipe(macro_group ~ ., data = train) %>%
+  step_zv(all_predictors())
+
+# Stable ridge by default 
+mod_glm <- multinom_reg(
+  penalty = 0.001,
+  mixture = 0
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+wf_glm <- workflow() %>%
+  add_recipe(rec_glm) %>%
+  add_model(mod_glm)
+
+# Train
+fit_glm <- fit(wf_glm, data = train)
+
+# Prediction and evaluation
+pred_glm <- predict(fit_glm, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_glm, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_group))
+
+metricas_cls(pred_glm, truth = macro_group, estimate = .pred_class)
+log_loss_multiclass(pred_glm)
+conf_mat(pred_glm, truth = macro_group, estimate = .pred_class)
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_glm$macro_group)
+colnames(select(pred_glm, starts_with(".pred_")))
+
+pred_glm <- pred_glm%>%
+  select(-.pred_class)
+
+```
+
+
+```{r}
+
+# ROC–AUC macro weighted
+auc_macro_w <- yardstick::roc_auc(
+  pred_glm,
+  truth = macro_group,
+  starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_macro_w  
+
+```
+GLMNET is a linear model, while our relationships appear to be nonlinear. For this reason, we will now test nonlinear models.
+
+#### Random Forest 
+```{r}
+# Recipe
+rec_rf <- recipe(macro_group ~ ., data = train) %>%
+  step_zv(all_predictors())
+
+mod_rf <- rand_forest(
+  mtry  = NULL,     
+  trees = 1000,
+  min_n = 2
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+wf_rf <- workflow() %>% add_recipe(rec_rf) %>% add_model(mod_rf)
+
+fit_rf <- fit(wf_rf, data = train)
+
+# Prediction + evaluation
+pred_rf <- predict(fit_rf, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_rf, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_group))
+
+metricas_cls(pred_rf, truth = macro_group, estimate = .pred_class)
+log_loss_multiclass(pred_rf)
+conf_mat(pred_rf, truth = macro_group, estimate = .pred_class)
+
+```
+
+
+```{r}
+# Check predicted classes
+levels(pred_rf$macro_group)
+colnames(select(pred_rf, starts_with(".pred_")))
+
+pred_rf <- pred_rf %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC macro weighted
+auc_rf <- yardstick::roc_auc(
+  pred_rf,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_rf
+
+```
+
+
+#### Random forest with SMOTE
+
+SMOTE (Synthetic Minority Over-sampling Technique) is used to balance class distributions by generating synthetic samples for underrepresented classes, helping Random Forest avoid bias toward majority classes and improving performance on minority labels. 
+
+```{r}
+
+# Recipe
+rec_rf <- recipe(macro_group ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  themis::step_smote(macro_group, over_ratio = 1.0, neighbors = 5, skip = TRUE)
+# `skip = TRUE` makes sure that SMOTE only applies to train
+
+# RF
+mod_rf <- rand_forest(
+  mtry  = NULL,     
+  trees = 1000,
+  min_n = 2
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+wf_rf <- workflow() %>% add_recipe(rec_rf) %>% add_model(mod_rf)
+
+set.seed(123)
+fit_rf <- fit(wf_rf, data = train)
+
+# Prediction + evaluation
+pred_rf <- predict(fit_rf, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_rf, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_group))
+
+metricas_cls(pred_rf, truth = macro_group, estimate = .pred_class)
+log_loss_multiclass(pred_rf)
+conf_mat(pred_rf, truth = macro_group, estimate = .pred_class)
+
+```
+
+```{r}
+levels(pred_rf$macro_group)
+colnames(select(pred_rf, starts_with(".pred_")))
+
+pred_rf <- pred_rf %>%
+  select(-.pred_class)
+
+```
+
+We have added the curves here because this one is the selected model. 
+
+```{r}
+# ROC–AUC macro weighted
+auc_rf <- yardstick::roc_auc(
+  pred_rf,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_rf
+
+# Roc curves
+roc_curves_rf <- roc_curve(
+  pred_rf,
+  truth = macro_group,
+  dplyr::starts_with(".pred_")
+)
+
+autoplot(roc_curves_rf)
+
+```
+
+
+#### Xgboost
+
+```{r}
+# Recipe
+rec_xgb <- recipe(macro_group ~ ., data = train) %>%
+  step_zv(all_predictors()) 
+
+
+# Base hyperparameters (without tuning)
+p <- ncol(train) - 1L
+mtry_val <- max(1, min(p, round(0.5 * p)))
+
+mod_xgb <- boost_tree(
+  trees          = 600,     
+  learn_rate     = 0.10,    
+  tree_depth     = 6,       
+  min_n          = 2,       
+  loss_reduction = 0,       
+  mtry           = mtry_val,
+  sample_size    = 0.8      
+) %>%
+  set_engine("xgboost") %>%     
+  set_mode("classification")
+
+wf_xgb <- workflow() %>%
+  add_recipe(rec_xgb) %>%
+  add_model(mod_xgb)
+
+# Train
+fit_xgb <- fit(wf_xgb, data = train)
+
+# Prediction + evaluation
+pred_xgb <- predict(fit_xgb, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_xgb, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_group))
+
+metricas_cls(pred_xgb, truth = macro_group, estimate = .pred_class)
+log_loss_multiclass(pred_xgb)
+conf_mat(pred_xgb, truth = macro_group, estimate = .pred_class)
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_xgb$macro_group)
+colnames(select(pred_xgb, starts_with(".pred_")))
+
+pred_xgb <- pred_xgb %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC for Xgboost
+auc_xgb <- yardstick::roc_auc(
+  pred_xgb,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_xgb
+
+```
+
+
+#### Xgboost with weights 
+
+```{r}
+
+tidymodels_prefer()
+set.seed(123)
+
+# Create weight column w with class case_weights
+train_w <- train %>%
+  dplyr::group_by(macro_group) %>%
+  dplyr::mutate(w_raw = 1 / dplyr::n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(w = hardhat::importance_weights(w_raw)) %>%
+  dplyr::select(-w_raw)
+
+# Recipe
+rec_xgb <- recipe(macro_group ~ ., data = train_w) %>%
+  step_zv(all_predictors())
+
+# Hyperparameters
+p <- ncol(train_w) - 2L  
+mtry_val <- max(1, min(p, round(0.5 * p)))
+
+mod_xgb <- boost_tree(
+  trees          = 600,
+  learn_rate     = 0.10,
+  tree_depth     = 6,
+  min_n          = 2,
+  loss_reduction = 0,
+  mtry           = mtry_val,
+  sample_size    = 0.8
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Recipe + model
+wf_xgb <- workflow() %>%
+  add_recipe(rec_xgb) %>%
+  add_model(mod_xgb)
+
+# Train
+fit_xgb <- fit(wf_xgb, data = train_w)
+
+# Prediction + evaluation
+pred_xgb <- predict(fit_xgb, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_xgb, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_group))
+
+metricas_cls(pred_xgb, truth = macro_group, estimate = .pred_class)
+log_loss_multiclass(pred_xgb)
+conf_mat(pred_xgb, truth = macro_group, estimate = .pred_class)
+
+# take out class before auc
+pred_xgb <- pred_xgb %>% dplyr::select(-.pred_class)
+
+# ROC–AUC macro weighted
+auc_xgb <- yardstick::roc_auc(
+  pred_xgb,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+auc_xgb
+
+```
+
+
+We have seen that the models do not have the best performance metrics, that is why we will try clustering to see if the results improve.  
+
+
+### Clustering 
+
+We will use the 14 groups we created earlier as the basis, since they make sense and are easier to explain in future analyses.
+
+We will build the dendrogram based on co-occurrences.
+
+
+```{r}
+# Tag dictionary
+map_tbl <- tibble::enframe(groups, name = "macro_group", value = "tag") %>%
+  unnest_longer(tag) %>%
+  mutate(tag = str_to_lower(tag)) %>%
+  distinct(tag, macro_group)
+
+# Transform df into long format and map macro_group
+tags_long <- df %>%
+  # select all columns starting with "tag"
+  select(starts_with("tag")) %>%
+  mutate(song_id = row_number()) %>%
+  pivot_longer(cols = starts_with("tag"),
+               names_to = "tag_col", values_to = "tag") %>%
+  mutate(tag = tag %>%
+           str_to_lower() %>%
+           str_remove("^mood/theme---") %>%  
+           str_trim()) %>%
+  filter(!is.na(tag), tag != "") %>%
+  left_join(map_tbl, by = "tag")            
+
+# Filter NA just in case
+tags_long <- tags_long %>% filter(!is.na(macro_group))
+
+# Group by song and keep unique macro_groups
+macros_by_song <- tags_long %>%
+  group_by(song_id) %>%
+  summarise(macros = list(sort(unique(macro_group))), .groups = "drop") %>%
+  filter(lengths(macros) >= 2)
+
+# Create unique pairs of macro_groups per song
+macro_pairs <- macros_by_song %>%
+  mutate(pairs = map(macros, ~ combn(.x, 2, simplify = FALSE))) %>%
+  select(pairs) %>%
+  unnest(pairs) %>%
+  mutate(
+    m1 = map_chr(pairs, 1),
+    m2 = map_chr(pairs, 2)
+  ) %>%
+  select(m1, m2)
+
+# Count pairs and graph
+min_n <- 10  
+top_macro_pairs <- macro_pairs %>%
+  count(m1, m2, sort = TRUE) %>%
+  filter(n >= min_n)
+
+
+top_macro_pairs
+
+# Top-20 combinations
+top_macro_pairs %>%
+  mutate(pair = paste(m1, m2, sep = " - ")) %>%
+  slice_max(n, n = 20) %>%
+  ggplot(aes(x = reorder(pair, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 20 combinations of Macro-groups",
+    x = "Couple (macro_group)",
+    y = "Frecuency"
+  ) +
+  theme_minimal()
+
+# Co-ocurrence heatmap
+top_macro_pairs %>%
+  ggplot(aes(m1, m2, fill = n)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Coocurrence of Macro-groups",
+       x = "Macro-group 1", y = "Macro-group 2") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+This needs to be normalized because the heatmap only reflects the absolute frequency of pairs. If Happy appears a lot in the dataset, it will inflate the co-occurrences just because it is very common.
+
+We are going to do this with Jaccard:
+- Interpret: proportion of overlap between two groups with respect to the total number of songs where either of the two appears.
+- Eliminates the effect of imbalance because it always compares with respect to the union.
+- Useful when you want to measure the actual similarity between two groups, regardless of their absolute frequencies.
+
+```{r}
+# Long format
+tags_long <- df %>%
+  select(track_id, starts_with("tag")) %>%
+  pivot_longer(cols = starts_with("tag"),
+               names_to = "tag_col", values_to = "tag") %>%
+  mutate(tag = tag %>% str_to_lower() %>% str_remove("^mood/theme---") %>% str_trim()) %>%
+  filter(!is.na(tag), tag != "") %>%
+  left_join(map_tbl, by = "tag") %>%
+  filter(!is.na(macro_group)) %>%
+  distinct(track_id, macro_group)   
+
+# Marginal frequency by macro_group 
+macro_totals <- tags_long %>%
+  count(macro_group, name = "total")
+
+# Unique pair by track
+pairs_by_track <- tags_long %>%
+  group_by(track_id) %>%
+  summarise(macros = list(sort(unique(macro_group))), .groups = "drop") %>%
+  filter(lengths(macros) >= 2) %>%
+  mutate(pairs = map(macros, ~ combn(.x, 2, simplify = FALSE))) %>%
+  select(pairs) %>%
+  unnest(pairs) %>%
+  transmute(
+    m1 = map_chr(pairs, 1),
+    m2 = map_chr(pairs, 2)
+  )
+
+# Intersections and Jaccard 
+pair_counts <- pairs_by_track %>% count(m1, m2, name = "intersect")
+
+jaccard_pairs <- pair_counts %>%
+  left_join(macro_totals, by = c("m1" = "macro_group")) %>%
+  rename(total_x = total) %>%
+  left_join(macro_totals, by = c("m2" = "macro_group")) %>%
+  rename(total_y = total) %>%
+  mutate(
+    union   = total_x + total_y - intersect,
+    jaccard = intersect / pmax(union, 1)
+  )
+
+# Heatmap Jaccard 
+ggplot(jaccard_pairs, aes(m1, m2, fill = jaccard)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Normalized coocurrence between macro_groups",
+       x = "Macro-group 1", y = "Macro-group 2", fill = "Jaccard") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+ 
+
+And now that we have our co-ocurrence matrix, we can apply clustering. 
+
+```{r}
+
+# Matrix: song x macro_group 
+inc <- tags_long %>%
+  mutate(v = 1L) %>%
+  tidyr::pivot_wider(names_from = macro_group, values_from = v, values_fill = 0L) %>%
+  arrange(track_id)
+
+X <- as.matrix(inc[, -1, drop = FALSE])
+storage.mode(X) <- "numeric"
+
+# Jaccard similarity (14×14) 
+G <- crossprod(X)                 # intersection
+f <- diag(G)                      # frecuency by macro_group
+U <- outer(f, f, "+") - G         # union
+J <- G / pmax(U, 1)               # similarity
+J[!is.finite(J)] <- 0
+diag(J) <- 1
+colnames(J) <- rownames(J) <- colnames(X)
+
+# Distance and clustering 
+D <- 1 - J
+diag(D) <- 0
+
+hc <- hclust(stats::as.dist(D), method = "ward.D2")  
+
+plot(hc, main = "Clustering of Macro-groups (Jaccard + Ward.D2)",
+     xlab = "", sub = "")
+
+# Cut in grups and visualize
+k <- 4
+clusters_vec <- cutree(hc, k = k)     
+clusters_vec
+
+# Rectangles in dendogram
+plot(hc, main = sprintf("Clustering of Macro-groups (k = %d)", k), xlab = "", sub = "")
+rect.hclust(hc, k = k, border = 2:(k+1))
+
+# Asignation table
+clusters_tbl <- tibble::tibble(
+  macro_group = names(clusters_vec),
+  cluster = as.integer(clusters_vec)
+) %>%
+  arrange(cluster, macro_group)
+
+clusters_tbl
+
+```
+
+## Modeling with clusters
+
+Now we will repeat the RF and Xgboost models but with clusters this time.  
+
+First we need to create macro_custers. 
+
+#### Macro_clusters + split
+```{r}
+tidymodels_prefer()
+
+# macro_group map 
+cluster_map <- tibble::tribble(
+  ~macro_group, ~macro_cluster,
+  "Romance",   1,
+  "Sadness",   1,
+  "Relax",     1,
+  "Nature",    1,
+  "Dark",      1,
+  "Inspire",   2,
+  "Corporate", 2,
+  "Epic",      2,
+  "Drama",     2,
+  "Happy",     3,
+  "Style",     3,
+  "Energy",    3,
+  "Kids",      4,
+  "Festive",   4
+)
+
+# Base dataset base 
+df_base <- df_scaled %>%
+  filter(!is.na(macro_group)) %>%
+  mutate(macro_group = factor(macro_group)) %>%
+  left_join(cluster_map, by = "macro_group") %>%
+  mutate(macro_cluster = factor(macro_cluster)) %>%
+  filter(!is.na(macro_cluster))    
+
+datos <- df_base %>% select(all_of(features_finales), macro_cluster)
+
+# Split and folds stratified by macro_cluster
+set.seed(123)
+split <- initial_split(datos, prop = 0.8, strata = macro_cluster)
+train <- training(split); test <- testing(split)
+folds <- vfold_cv(train, v = 4, strata = macro_cluster)
+
+# Metrics
+f_macro <- yardstick::metric_tweak("f_macro", yardstick::f_meas, estimator = "macro")
+metricas_cls <- metric_set(accuracy, bal_accuracy, kap, f_macro, mn_log_loss)
+
+```
+
+#### Random Forest
+```{r}
+
+# Recipe
+rec_rf_mc <- recipe(macro_cluster ~ ., data = train) %>%
+  step_zv(all_predictors())
+
+# RF
+rf_mc <- rand_forest(
+  trees = 1000,   
+  mtry  = NULL,   
+  min_n = 2       
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+wf_rf_mc <- workflow() %>%
+  add_recipe(rec_rf_mc) %>%
+  add_model(rf_mc)
+
+# Train
+fit_rf_mc <- fit(wf_rf_mc, data = train)
+
+# Prediction + evaluation
+pred_rf_mc <- predict(fit_rf_mc, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_rf_mc, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_cluster))
+
+# Metrics 
+precision_macro <- yardstick::metric_tweak("precision_macro", yardstick::precision, estimator = "macro")
+recall_macro    <- yardstick::metric_tweak("recall_macro",    yardstick::recall,    estimator = "macro")
+f1_macro        <- yardstick::metric_tweak("f1_macro",        yardstick::f_meas,    estimator = "macro", beta = 1)
+
+metricas_cls <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::bal_accuracy,
+  precision_macro,
+  recall_macro,
+  f1_macro
+)
+
+
+metricas_cls(pred_rf_mc, truth = macro_cluster, estimate = .pred_class)
+
+
+# Log-loss 
+log_loss_multiclass <- function(pred_df, truth = macro_cluster){
+  lvls      <- levels(dplyr::pull(pred_df, {{ truth }}))
+  prob_cols <- intersect(paste0(".pred_", lvls), names(pred_df))
+  yardstick::mn_log_loss(pred_df, truth = {{ truth }}, !!!rlang::syms(prob_cols))
+}
+
+log_loss_multiclass(pred_rf_mc)
+
+conf_mat(pred_rf_mc, truth = macro_cluster, estimate = .pred_class)
+
+
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_rf_mc$macro_group)
+colnames(select(pred_rf_mc, starts_with(".pred_")))
+
+pred_rf_mc<- pred_rf_mc %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC for Xgboost
+auc_rf_mc <- yardstick::roc_auc(
+  pred_rf_mc,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_xrf_mc
+
+```
+
+#### Random Forest with SMOTE
+```{r}
+
+# Recipe
+rec_rf_mc <- recipe(macro_cluster ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  themis::step_smote(macro_cluster, over_ratio = 1.0, neighbors = 5, skip = TRUE)
+
+
+# RF
+rf_mc <- rand_forest(
+  trees = 1000,
+  mtry  = NULL,   
+  min_n = 2
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+wf_rf_mc <- workflow() %>%
+  add_recipe(rec_rf_mc) %>%
+  add_model(rf_mc)
+
+set.seed(123)
+fit_rf_mc <- fit(wf_rf_mc, data = train)
+
+# Prediction + evaluation
+pred_rf_mc <- predict(fit_rf_mc, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_rf_mc, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_cluster))
+
+# Metrics
+precision_macro <- yardstick::metric_tweak("precision_macro", yardstick::precision, estimator = "macro")
+recall_macro    <- yardstick::metric_tweak("recall_macro",    yardstick::recall,    estimator = "macro")
+f1_macro        <- yardstick::metric_tweak("f1_macro",        yardstick::f_meas,    estimator = "macro", beta = 1)
+
+metricas_cls <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::bal_accuracy,
+  precision_macro,
+  recall_macro,
+  f1_macro
+)
+
+metricas_cls(pred_rf_mc, truth = macro_cluster, estimate = .pred_class)
+
+# Log-loss 
+log_loss_multiclass <- function(pred_df, truth = macro_cluster){
+  lvls      <- levels(dplyr::pull(pred_df, {{ truth }}))
+  prob_cols <- intersect(paste0(".pred_", lvls), names(pred_df))
+  yardstick::mn_log_loss(pred_df, truth = {{ truth }}, !!!rlang::syms(prob_cols))
+}
+log_loss_multiclass(pred_rf_mc)
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_rf_mc$macro_group)
+colnames(select(pred_rf_mc, starts_with(".pred_")))
+
+pred_rf_mc<- pred_rf_mc %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC for Xgboost
+auc_rf_mc <- yardstick::roc_auc(
+  pred_rf_mc,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_xrf_mc
+
+```
+
+#### Xgboost
+
+```{r}
+
+# Recipe
+rec_xgb_mc <- recipe(macro_cluster ~ ., data = train) %>%
+  step_zv(all_predictors()) 
+
+# Model
+p <- ncol(train) - 1L
+mtry_val <- max(1, min(p, round(0.5 * p)))  
+
+mod_xgb_mc <- boost_tree(
+  trees          = 700,
+  learn_rate     = 0.10,
+  tree_depth     = 6,
+  min_n          = 2,
+  loss_reduction = 0,
+  mtry           = mtry_val,
+  sample_size    = 0.9
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+wf_xgb_mc <- workflow() %>%
+  add_recipe(rec_xgb_mc) %>%
+  add_model(mod_xgb_mc)
+
+# Train
+fit_xgb_mc <- fit(wf_xgb_mc, data = train)
+
+# Prediction + evaluation
+pred_xgb_mc <- predict(fit_xgb_mc, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_xgb_mc, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_cluster))
+
+# Metrics
+precision_macro <- yardstick::metric_tweak("precision_macro", yardstick::precision, estimator = "macro")
+recall_macro    <- yardstick::metric_tweak("recall_macro",    yardstick::recall,    estimator = "macro")
+f1_macro        <- yardstick::metric_tweak("f1_macro",        yardstick::f_meas,    estimator = "macro", beta = 1)
+
+metricas_cls <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::bal_accuracy,
+  precision_macro,
+  recall_macro,
+  f1_macro
+)
+
+metricas_cls(pred_xgb_mc, truth = macro_cluster, estimate = .pred_class)
+
+# Log-loss 
+log_loss_multiclass <- function(pred_df, truth = macro_cluster){
+  lvls      <- levels(dplyr::pull(pred_df, {{ truth }}))
+  prob_cols <- intersect(paste0(".pred_", lvls), names(pred_df))
+  yardstick::mn_log_loss(pred_df, truth = {{ truth }}, !!!rlang::syms(prob_cols))
+}
+log_loss_multiclass(pred_xgb_mc)
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_xgb_mc$macro_group)
+colnames(select(pred_xgb_mc, starts_with(".pred_")))
+
+pred_xgb_mc <- pred_xgb_mc %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC for Xgboost
+auc_xgb_mc <- yardstick::roc_auc(
+  pred_xgb_mc,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_xgb
+
+
+```
+
+#### Xgboost with weights
+```{r}
+
+tidymodels_prefer()
+
+# Weights by class
+w_tab  <- table(train$macro_cluster)
+prop   <- as.numeric(w_tab) / sum(w_tab)
+names(prop) <- names(w_tab)
+
+alpha  <- 1.0                            
+w_cls  <- (1 / prop)^alpha
+w_cls  <- w_cls / mean(w_cls)            
+names(w_cls) <- names(w_tab)
+
+# Witghts by row
+train_w <- train %>%
+  dplyr::mutate(w = hardhat::importance_weights(w_cls[macro_cluster]))
+
+# Recipe
+rec_xgb_mc <- recipe(macro_cluster ~ ., data = train_w) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())  
+
+# Model
+p <- ncol(train) - 1L
+mtry_val <- max(1, min(p, round(0.5 * p)))
+
+mod_xgb_mc <- boost_tree(
+  trees          = 700,
+  learn_rate     = 0.10,
+  tree_depth     = 6,
+  min_n          = 2,
+  loss_reduction = 0,
+  mtry           = mtry_val,
+  sample_size    = 0.9
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+wf_xgb_mc <- workflow() %>%
+  add_recipe(rec_xgb_mc) %>%
+  add_model(mod_xgb_mc) %>%
+  add_case_weights(w)   # w are weights
+
+# Train with weights
+fit_xgb_w <- fit(wf_xgb_mc, data = train_w)
+
+# Prediction + evaluation
+pred_xgb_w <- predict(fit_xgb_w, test, type = "class") %>%
+  dplyr::bind_cols(predict(fit_xgb_w, test, type = "prob")) %>%
+  dplyr::bind_cols(test %>% dplyr::select(macro_cluster))
+
+precision_macro <- yardstick::metric_tweak("precision_macro", yardstick::precision, estimator = "macro")
+recall_macro    <- yardstick::metric_tweak("recall_macro",    yardstick::recall,    estimator = "macro")
+f1_macro        <- yardstick::metric_tweak("f1_macro",        yardstick::f_meas,    estimator = "macro", beta = 1)
+
+metricas_cls <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::bal_accuracy,
+  precision_macro,
+  recall_macro,
+  f1_macro
+)
+
+metricas_cls(pred_xgb_w, truth = macro_cluster, estimate = .pred_class)
+
+# Log-loss 
+log_loss_multiclass <- function(pred_df, truth = macro_cluster){
+  lvls      <- levels(dplyr::pull(pred_df, {{ truth }}))
+  prob_cols <- intersect(paste0(".pred_", lvls), names(pred_df))
+  yardstick::mn_log_loss(pred_df, truth = {{ truth }}, !!!rlang::syms(prob_cols))
+}
+log_loss_multiclass(pred_xgb_w)
+
+```
+
+```{r}
+# Check predicted classes
+levels(pred_xgb_w$macro_group)
+colnames(select(pred_xgb_w, starts_with(".pred_")))
+
+pred_xgb_w <- pred_xgb_w %>%
+  select(-.pred_class)
+
+```
+
+```{r}
+# ROC–AUC for Xgboost
+auc_xgb_w <- yardstick::roc_auc(
+  pred_xgb_w,
+  truth = macro_group,
+  dplyr::starts_with(".pred_"),
+  estimator = "macro_weighted"
+)
+
+auc_xgb
+
+
+```
+
+## Interpretability 
+
+We have chosen the Random Forest model with SMOTE as our final model, and will now compute its SHAP values to interpret the results.
+
+Our goal is to produce a final visualization that includes all 14 variables with their corresponding SHAP plots. However, generating all 14 plots simultaneously is computationally intensive, so we will compute them individually and later merge them into a single figure. This figure will be organized according to the four clusters we created: it will contain four rows, one for each cluster, and within each row we will display the SHAP plots of the macro groups belonging to that cluster.
+
+
+We will create a unique setup and then change the little parts to code different macro groups. 
+
+```{r}
+tidymodels_prefer()
+set.seed(123)
+
+# Model trained for 14 classes 
+fit_14 <- fit_rf
+
+# Recipe, model and transformed data
+rec_14 <- workflows::extract_recipe(fit_14)
+mod_14 <- workflows::extract_fit_parsnip(fit_14)
+X_baked_pool <- recipes::bake(rec_14, new_data = test)
+
+# Top-K features by native importance
+TOP_K <- 40
+top_feats <- vip::vi(mod_14) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = TOP_K) %>%
+  pull(Variable)
+
+X_baked_pool <- dplyr::select(X_baked_pool, dplyr::any_of(top_feats))
+
+# Global parameters of precision/cost
+NSIM <- 20
+NROW_SAMPLE <- 300
+TOP_N_SHOW <- 10
+
+# Precision wrapper: probability of a given class
+pred_prob_for <- function(clase) {
+  function(object, newdata) {
+    probs <- predict(object, new_data = newdata, type = "prob")
+    as.numeric(probs[[paste0(".pred_", clase)]])
+  }
+}
+
+# Reutilizable function
+compute_shap_for_class <- function(clase_objetivo,
+                                   nsim = NSIM,
+                                   n_sample = NROW_SAMPLE,
+                                   top_n_show = TOP_N_SHOW,
+                                   save_png = TRUE,
+                                   png_width = 7.5, png_height = 5, png_dpi = 130) {
+
+  # Check that the class exists
+  niv_prob <- names(predict(mod_14, new_data = X_baked_pool[1, , drop = FALSE], type = "prob"))
+  niv_clases <- sub("^\\.pred_", "", niv_prob)
+  stopifnot(clase_objetivo %in% niv_clases)
+
+  # For making it faster 
+  X_use <- if (!is.null(n_sample) && nrow(X_baked_pool) > n_sample) {
+    X_baked_pool[sample(seq_len(nrow(X_baked_pool)), n_sample), , drop = FALSE]
+  } else {
+    X_baked_pool
+  }
+
+  # SHAP 
+  S <- fastshap::explain(
+    object       = mod_14,
+    X            = as.data.frame(X_use),
+    pred_wrapper = pred_prob_for(clase_objetivo),
+    nsim         = nsim,
+    adjust       = TRUE
+  )
+
+  sv <- shapviz::shapviz(as.matrix(S), X = as.data.frame(X_use))
+
+  plt <- shapviz::sv_importance(sv, kind = "bee", max_display = top_n_show) +
+    ggtitle(sprintf("%s — SHAP (Top-%d, n=%d, nsim=%d)",
+                    clase_objetivo, top_n_show, nrow(X_use), nsim)) +
+    theme(plot.title = element_text(size = 11, face = "bold"))
+
+  rank_tbl <- tibble(
+    feature       = colnames(S),
+    mean_abs_shap = colMeans(abs(S), na.rm = TRUE)
+  ) %>%
+    arrange(desc(mean_abs_shap)) %>%
+    slice_head(n = top_n_show)
+
+  if (isTRUE(save_png)) {
+    ggsave(sprintf("shap_%s.png", clase_objetivo), plt,
+           width = png_width, height = png_height, dpi = png_dpi)
+  }
+
+  list(plot = plt, rank = rank_tbl, shap = S, shapviz = sv)
+}
+
+```
+
+And now we will begin with the KIDS group. 
+
+```{r}
+res_kids <- compute_shap_for_class("Kids")
+print(res_kids$plot)
+print(res_kids$rank)
+
+```
+
+Festive 
+```{r}
+res_festive <- compute_shap_for_class("Festive")
+print(res_festive$plot)
+print(res_festive$rank)
+
+```
+
+Sadness
+```{r}
+res_sadness <- compute_shap_for_class("Sadness")
+print(res_sadness$plot)
+print(res_sadness$rank)
+```
+
+
+Romance
+```{r}
+res_romance <- compute_shap_for_class("Romance")
+print(res_romance$plot)
+print(res_romance$rank)
+```
+
+Relax
+```{r}
+res_relax <- compute_shap_for_class("Relax")
+print(res_relax$plot)
+print(res_relax$rank)
+```
+
+Nature
+```{r}
+res_nature <- compute_shap_for_class("Nature")
+print(res_nature$plot)
+print(res_nature$rank)
+```
+
+Dark 
+```{r}
+res_dark <- compute_shap_for_class("Dark")
+print(res_dark$plot)
+print(res_dark$rank)
+```
+
+Inspire
+```{r}
+res_inspire <- compute_shap_for_class("Inspire")
+print(res_inspire$plot)
+print(res_inspire$rank)
+```
+
+
+Corporate
+```{r}
+res_corporate <- compute_shap_for_class("Corporate")
+print(res_corporate$plot)
+print(res_corporate$rank)
+```
+
+
+Epic
+```{r}
+res_epic <- compute_shap_for_class("Epic")
+print(res_epic$plot)
+print(res_epic$rank)
+```
+
+
+Drama
+```{r}
+res_drama <- compute_shap_for_class("Drama")
+print(res_drama$plot)
+print(res_drama$rank)
+```
+
+
+Style
+```{r}
+res_style <- compute_shap_for_class("Style")
+print(res_style$plot)
+print(res_style$rank)
+```
+
+
+Happy
+```{r}
+res_happy <- compute_shap_for_class("Happy")
+print(res_happy$plot)
+print(res_happy$rank)
+```
+
+Energy
+```{r}
+res_energy <- compute_shap_for_class("Energy")
+print(res_energy$plot)
+print(res_energy$rank)
+```
+
+AAnd with that, we have our 14 SHAP value plots. The next step is to arrange them into a single visualization. The original idea of putting them all together in one figure is not feasible, since the plots become too small and difficult to read. Instead, we will create two separate figures: one containing clusters 1 and 4, and another containing clusters 2 and 3.
+
+
+```{r}
+# Assign a name to each plot
+kids_plot    <- res_kids$plot
+festive_plot <- res_festive$plot
+style_plot   <- res_style$plot
+happy_plot   <- res_happy$plot
+energy_plot  <- res_energy$plot
+sadness_plot <- res_sadness$plot
+romance_plot <- res_romance$plot
+relax_plot   <- res_relax$plot
+nature_plot  <- res_nature$plot
+dark_plot    <- res_dark$plot
+inspire_plot <- res_inspire$plot
+corporate_plot <- res_corp$plot
+epic_plot    <- res_epic$plot
+drama_plot   <- res_drama$plot
+```
+
+
+
+```{r}
+
+# helpers
+rm_legend <- function(p) p + theme(legend.position = "none")
+retitle   <- function(p, t) p + ggtitle(t)
+
+# Plot A: Clusters 1 and 4
+row_c1 <- wrap_plots(
+  rm_legend(retitle(kids_plot,    "Kids")),
+  rm_legend(retitle(festive_plot, "Festive")),
+  nrow = 1
+) + plot_annotation(title = "Cluster 1: Kids, Festive") &
+  theme(plot.title = element_text(hjust = 0, size = 12, face = "bold"))
+
+row_c4 <- wrap_plots(
+  rm_legend(retitle(style_plot,  "Style")),
+  rm_legend(retitle(happy_plot,  "Happy")),
+  rm_legend(retitle(energy_plot, "Energy")),
+  nrow = 1
+) + plot_annotation(title = "Cluster 4: Style, Happy, Energy") &
+  theme(plot.title = element_text(hjust = 0, size = 12, face = "bold"))
+
+mosaico_A <- row_c1 / row_c4 +
+  plot_annotation(
+    title = "SHAP for macro_group – clusters 1 and 4",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  ) &
+  theme(axis.text = element_text(size = 7), axis.title = element_text(size = 8))
+
+mosaico_A
+ggsave("shap_clusters_1y4.png", mosaico_A, width = 14, height = 6.5, dpi = 150)
+
+
+# Plot B: Clusters 2 and 3
+row_c2 <- wrap_plots(
+  rm_legend(retitle(sadness_plot, "Sadness")),
+  rm_legend(retitle(romance_plot, "Romance")),
+  rm_legend(retitle(relax_plot,   "Relax")),
+  rm_legend(retitle(nature_plot,  "Nature")),
+  rm_legend(retitle(dark_plot,    "Dark")),
+  nrow = 1
+) + plot_annotation(title = "Cluster 2: Sadness, Romance, Relax, Nature, Dark") &
+  theme(plot.title = element_text(hjust = 0, size = 12, face = "bold"))
+
+row_c3 <- wrap_plots(
+  rm_legend(retitle(inspire_plot,   "Inspire")),
+  rm_legend(retitle(corporate_plot, "Corporate")),
+  rm_legend(retitle(epic_plot,      "Epic")),
+  rm_legend(retitle(drama_plot,     "Drama")),
+  nrow = 1
+) + plot_annotation(title = "Cluster 3: Inspire, Corporate, Epic, Drama") &
+  theme(plot.title = element_text(hjust = 0, size = 12, face = "bold"))
+
+mosaico_B <- row_c2 / row_c3 +
+  plot_annotation(
+    title = "SHAP for macro_group – clusters 2 and 3",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  ) &
+  theme(axis.text = element_text(size = 7), axis.title = element_text(size = 8))
+
+mosaico_B
+ggsave("shap_clusters_2y3.png", mosaico_B, width = 16, height = 7.5, dpi = 150)
+
+```
+
+And we have our SHAP values ready to interpret! 
+
